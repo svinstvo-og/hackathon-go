@@ -802,6 +802,11 @@ func ordersV2Handler(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "Invalid timestamps", http.StatusBadRequest)
 			return
 		}
+		const hourMs = 3600000
+		if start%hourMs != 0 || end%hourMs != 0 || end <= start || (end-start) != hourMs {
+			http.Error(w, "Invalid Contract Timestamps", http.StatusBadRequest)
+			return
+		}
 
 		mu.RLock()
 		var bids []*Order
