@@ -44,6 +44,7 @@ type Trade struct {
 	Timestamp     int64
 	DeliveryStart int64 // Added for filtering
 	DeliveryEnd   int64 // Added for filtering
+	Version       int
 }
 
 var (
@@ -863,6 +864,7 @@ func matchOrder(order *Order) int64 {
 			Timestamp:     now,
 			DeliveryStart: order.DeliveryStart, // Populate Contract Info
 			DeliveryEnd:   order.DeliveryEnd,   // Populate Contract Info
+			Version:       2,
 		}
 		trades = append(trades, newTrade)
 
@@ -1309,6 +1311,7 @@ func tradesHandler(w http.ResponseWriter, r *http.Request) {
 			Timestamp:     now,
 			DeliveryStart: order.DeliveryStart,
 			DeliveryEnd:   order.DeliveryEnd,
+			Version:       1,
 		}
 		trades = append(trades, newTrade)
 
@@ -1317,6 +1320,69 @@ func tradesHandler(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/x-galacticbuf")
 		w.Write(encoded)
 	}
+}
+
+// GET /v2/trades - Public trade history for a contract (V2 only)
+func tradesV2Handler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	q := r.URL.Query()
+	startStr := q.Get("delivery_start")
+	endStr := q.Get("delivery_end")
+	if startStr == "" || endStr == "" {
+		http.Error(w, "Missing query params", http.StatusBadRequest)
+		return
+	}
+
+	start, err1 := strconv.ParseInt(startStr, 10, 64)
+	end, err2 := strconv.ParseInt(endStr, 10, 64)
+	if err1 != nil || err2 != nil {
+		http.Error(w, "Invalid timestamps", http.StatusBadRequest)
+		return
+	}
+	const hourMs = 3600000
+	if start%hourMs != 0 || end%hourMs != 0 || end <= start || (end-start) != hourMs {
+		http.Error(w, "Invalid Contract Timestamps", http.StatusBadRequest)
+		return
+	}
+
+	mu.RLock()
+	filtered := make([]*Trade, 0)
+	for _, t := range trades {
+		if t.Version != 2 {
+			continue
+		}
+		if t.DeliveryStart == start && t.DeliveryEnd == end {
+			filtered = append(filtered, t)
+		}
+	}
+	mu.RUnlock()
+
+	sort.Slice(filtered, func(i, j int) bool {
+		return filtered[i].Timestamp > filtered[j].Timestamp
+	})
+
+	list := make([]map[string]GValue, 0, len(filtered))
+	for _, t := range filtered {
+		list = append(list, map[string]GValue{
+			"trade_id":       t.ID,
+			"buyer_id":       t.BuyerID,
+			"seller_id":      t.SellerID,
+			"price":          t.Price,
+			"quantity":       t.Quantity,
+			"delivery_start": t.DeliveryStart,
+			"delivery_end":   t.DeliveryEnd,
+			"timestamp":      t.Timestamp,
+		})
+	}
+
+	resp := map[string]GValue{"trades": list}
+	encoded, _ := EncodeMessage(resp)
+	w.Header().Set("Content-Type", "application/x-galacticbuf")
+	w.Write(encoded)
 }
 
 // GET /v2/my-trades - Returns auth user's trades for a specific contract
@@ -1430,6 +1496,7 @@ func main() {
 	mux.HandleFunc("/v2/my-orders", myOrdersHandler)
 
 	mux.HandleFunc("/trades", tradesHandler)
+	mux.HandleFunc("/v2/trades", tradesV2Handler)
 	mux.HandleFunc("/v2/my-trades", myTradesHandler)
 
 	log.Println("Galactic Exchange started on :8080")

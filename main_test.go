@@ -273,3 +273,72 @@ func TestCancelOrder(t *testing.T) {
 		t.Errorf("expected 404 for already cancelled, got %d", rr2.Code)
 	}
 }
+
+func TestTradesV2Handler_Success(t *testing.T) {
+	resetState()
+	const start = int64(3600000 * 50)
+	const end = start + 3600000
+
+	mu.Lock()
+	trades = append(trades,
+		&Trade{ID: "v2-new", BuyerID: "b", SellerID: "s", Price: 100, Quantity: 5, Timestamp: 2000, DeliveryStart: start, DeliveryEnd: end, Version: 2},
+		&Trade{ID: "v2-old", BuyerID: "b2", SellerID: "s2", Price: 90, Quantity: 3, Timestamp: 1000, DeliveryStart: start, DeliveryEnd: end, Version: 2},
+		&Trade{ID: "v2-other", BuyerID: "b", SellerID: "s", Price: 80, Quantity: 2, Timestamp: 3000, DeliveryStart: start + 3600000, DeliveryEnd: end + 3600000, Version: 2},
+		&Trade{ID: "v1-trade", BuyerID: "b", SellerID: "s", Price: 70, Quantity: 1, Timestamp: 4000, DeliveryStart: start, DeliveryEnd: end, Version: 1},
+	)
+	mu.Unlock()
+
+	req := httptest.NewRequest(http.MethodGet, "/v2/trades?delivery_start=180000000&delivery_end=183600000", nil)
+	rr := httptest.NewRecorder()
+	tradesV2Handler(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rr.Code)
+	}
+
+	resp, err := DecodeMessage(rr.Body)
+	if err != nil {
+		t.Fatalf("decode failed: %v", err)
+	}
+
+	rawTrades, ok := resp["trades"].([]GValue)
+	if !ok {
+		t.Fatalf("trades missing or wrong type")
+	}
+	if len(rawTrades) != 2 {
+		t.Fatalf("expected 2 trades, got %d", len(rawTrades))
+	}
+
+	first, ok := rawTrades[0].(map[string]GValue)
+	if !ok {
+		t.Fatalf("first trade wrong type %T", rawTrades[0])
+	}
+	second, ok := rawTrades[1].(map[string]GValue)
+	if !ok {
+		t.Fatalf("second trade wrong type %T", rawTrades[1])
+	}
+
+	if first["trade_id"] != "v2-new" || second["trade_id"] != "v2-old" {
+		t.Fatalf("trades not sorted newest-first or wrong filtering: %+v, %+v", first["trade_id"], second["trade_id"])
+	}
+	if first["delivery_start"].(int64) != start || first["delivery_end"].(int64) != end {
+		t.Fatalf("expected contract window on first trade")
+	}
+}
+
+func TestTradesV2Handler_InvalidParams(t *testing.T) {
+	resetState()
+	req := httptest.NewRequest(http.MethodGet, "/v2/trades", nil)
+	rr := httptest.NewRecorder()
+	tradesV2Handler(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for missing params, got %d", rr.Code)
+	}
+
+	reqBad := httptest.NewRequest(http.MethodGet, "/v2/trades?delivery_start=1&delivery_end=2", nil)
+	rrBad := httptest.NewRecorder()
+	tradesV2Handler(rrBad, reqBad)
+	if rrBad.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for unaligned params, got %d", rrBad.Code)
+	}
+}
