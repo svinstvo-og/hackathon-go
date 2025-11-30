@@ -7,8 +7,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/gorilla/websocket"
 )
 
 func resetState() {
@@ -562,4 +565,169 @@ func TestOrdersV2Post_InvalidExecutionType(t *testing.T) {
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 for invalid execution_type, got %d", rr.Code)
 	}
+}
+
+func TestTradeStream(t *testing.T) {
+	resetState()
+	go hub.run()
+
+	server := httptest.NewServer(http.HandlerFunc(tradeStreamHandler))
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("failed to connect to websocket: %v", err)
+	}
+	defer conn.Close()
+
+	// Simulate a trade
+	trade := &Trade{
+		ID:            "trade1",
+		BuyerID:       "buyer",
+		SellerID:      "seller",
+		Price:         100,
+		Quantity:      10,
+		Timestamp:     nowMillis(),
+		DeliveryStart: 3600000,
+		DeliveryEnd:   7200000,
+		Version:       2,
+	}
+
+	// Broadcast the trade
+	broadcastTrade(trade)
+
+	// Read message from WebSocket
+	msgType, msg, err := conn.ReadMessage()
+	if err != nil {
+		t.Fatalf("failed to read message: %v", err)
+	}
+
+	if msgType != websocket.BinaryMessage {
+		t.Errorf("expected binary message, got %d", msgType)
+	}
+
+	decoded, err := DecodeMessage(bytes.NewReader(msg))
+	if err != nil {
+		t.Fatalf("failed to decode message: %v", err)
+	}
+
+	if decoded["trade_id"] != "trade1" {
+		t.Errorf("expected trade_id 'trade1', got %v", decoded["trade_id"])
+	}
+}
+
+func TestOrdersV2Post_SelfMatchPrevention(t *testing.T) {
+	resetState()
+
+	const start = int64(3600000 * 300)
+	const end = start + 3600000
+
+	nowFunc = func() time.Time { return time.UnixMilli(start).Add(-time.Minute) }
+
+	setupUserWithToken("maker", "makerTok")
+
+	mu.Lock()
+	orders["rest-sell"] = &Order{
+		ID:            "rest-sell",
+		Version:       2,
+		Status:        "ACTIVE",
+		Side:          "sell",
+		Price:         80,
+		Quantity:      5,
+		DeliveryStart: start,
+		DeliveryEnd:   end,
+		Owner:         "maker",
+		Timestamp:     nowMillis(),
+		ExecutionType: ExecutionTypeGTC,
+	}
+	mu.Unlock()
+
+	reqBody := map[string]GValue{
+		"side":           "buy",
+		"price":          int64(100),
+		"quantity":       int64(3),
+		"delivery_start": start,
+		"delivery_end":   end,
+	}
+	req := newRequest(t, http.MethodPost, "/v2/orders", reqBody)
+	req.Header.Set("Authorization", "Bearer makerTok")
+	rr := httptest.NewRecorder()
+
+	ordersV2Handler(rr, req)
+
+	if rr.Code != http.StatusPreconditionFailed {
+		t.Fatalf("expected 412 self-match prevention, got %d", rr.Code)
+	}
+
+	mu.RLock()
+	if len(orders) != 1 {
+		t.Fatalf("order book should remain unchanged, got %d", len(orders))
+	}
+	if len(trades) != 0 {
+		t.Fatalf("no trades should execute, got %d", len(trades))
+	}
+	mu.RUnlock()
+}
+
+func TestModifyOrder_SelfMatchPrevention(t *testing.T) {
+	resetState()
+
+	const start = int64(3600000 * 400)
+	const end = start + 3600000
+
+	nowFunc = func() time.Time { return time.UnixMilli(start).Add(-time.Minute) }
+
+	setupUserWithToken("user", "tok")
+
+	mu.Lock()
+	orders["buy-order"] = &Order{
+		ID:            "buy-order",
+		Version:       2,
+		Status:        "ACTIVE",
+		Side:          "buy",
+		Price:         90,
+		Quantity:      5,
+		DeliveryStart: start,
+		DeliveryEnd:   end,
+		Owner:         "user",
+		Timestamp:     nowMillis(),
+		ExecutionType: ExecutionTypeGTC,
+	}
+	orders["sell-order"] = &Order{
+		ID:            "sell-order",
+		Version:       2,
+		Status:        "ACTIVE",
+		Side:          "sell",
+		Price:         100,
+		Quantity:      5,
+		DeliveryStart: start,
+		DeliveryEnd:   end,
+		Owner:         "user",
+		Timestamp:     nowMillis(),
+		ExecutionType: ExecutionTypeGTC,
+	}
+	mu.Unlock()
+
+	reqBody := map[string]GValue{"price": int64(80), "quantity": int64(5)}
+	req := newRequest(t, http.MethodPut, "/v2/orders/sell-order", reqBody)
+	req.Header.Set("Authorization", "Bearer tok")
+	rr := httptest.NewRecorder()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v2/orders/", orderOperationHandler)
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusPreconditionFailed {
+		t.Fatalf("expected 412 on self-matching modify, got %d", rr.Code)
+	}
+
+	mu.RLock()
+	if orders["sell-order"].Price != 100 {
+		t.Fatalf("modify should be rolled back; expected price 100, got %d", orders["sell-order"].Price)
+	}
+	if len(trades) != 0 {
+		t.Fatalf("no trades should execute, got %d", len(trades))
+	}
+	mu.RUnlock()
 }

@@ -14,6 +14,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/gorilla/websocket"
 )
 
 // --- In-Memory Database ---
@@ -60,6 +62,80 @@ var (
 	collaterals        = make(map[string]int64) // max allowed negative balance
 	orderCounter int64 = 0
 )
+
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool {
+		return true // Allow all connections
+	},
+}
+
+type tradeStreamHub struct {
+	clients    map[*websocket.Conn]bool
+	broadcast  chan []byte
+	register   chan *websocket.Conn
+	unregister chan *websocket.Conn
+	mu         sync.Mutex
+}
+
+var hub = tradeStreamHub{
+	clients:    make(map[*websocket.Conn]bool),
+	broadcast:  make(chan []byte, 256),
+	register:   make(chan *websocket.Conn),
+	unregister: make(chan *websocket.Conn),
+}
+
+var broadcastCtrl = struct {
+	sync.Mutex
+	paused bool
+	buffer []*Trade
+}{}
+
+func (h *tradeStreamHub) run() {
+	for {
+		select {
+		case client := <-h.register:
+			h.mu.Lock()
+			h.clients[client] = true
+			h.mu.Unlock()
+		case client := <-h.unregister:
+			h.mu.Lock()
+			if _, ok := h.clients[client]; ok {
+				delete(h.clients, client)
+				client.Close()
+			}
+			h.mu.Unlock()
+		case message := <-h.broadcast:
+			h.mu.Lock()
+			for client := range h.clients {
+				err := client.WriteMessage(websocket.BinaryMessage, message)
+				if err != nil {
+					go func(c *websocket.Conn) {
+						h.unregister <- c
+					}(client)
+				}
+			}
+			h.mu.Unlock()
+		}
+	}
+}
+
+func tradeStreamHandler(w http.ResponseWriter, r *http.Request) {
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Println("upgrade:", err)
+		return
+	}
+	hub.register <- conn
+
+	// Keep the connection alive, but we don't need to read from it.
+	// The unregister logic will handle cleanup on disconnect.
+	for {
+		if _, _, err := conn.NextReader(); err != nil {
+			hub.unregister <- conn
+			break
+		}
+	}
+}
 
 var nowFunc = func() time.Time {
 	return time.Now().UTC()
@@ -392,6 +468,16 @@ func getUserFromToken(r *http.Request) (string, bool) {
 		return "", false
 	}
 	token := authHeader[7:]
+	mu.RLock()
+	defer mu.RUnlock()
+	user, ok := tokens[token]
+	return user, ok
+}
+
+func getUserFromRawToken(token string) (string, bool) {
+	if token == "" {
+		return "", false
+	}
 	mu.RLock()
 	defer mu.RUnlock()
 	user, ok := tokens[token]
@@ -918,6 +1004,39 @@ func ordersV1Handler(w http.ResponseWriter, r *http.Request) {
 
 // matchOrder executes the core matching logic.
 // It assumes mu is already locked.
+func detectSelfMatchLocked(order *Order) *Order {
+	for _, resting := range orders {
+		if resting == nil || resting.ID == order.ID {
+			continue
+		}
+		if resting.Owner != order.Owner {
+			continue
+		}
+		if resting.Version != 2 {
+			continue
+		}
+		if resting.Status != "ACTIVE" && resting.Status != "OPEN" {
+			continue
+		}
+		if resting.Quantity <= 0 {
+			continue
+		}
+		if resting.DeliveryStart != order.DeliveryStart || resting.DeliveryEnd != order.DeliveryEnd {
+			continue
+		}
+		if resting.Side == order.Side {
+			continue
+		}
+		if order.Side == "buy" && order.Price >= resting.Price {
+			return resting
+		}
+		if order.Side == "sell" && order.Price <= resting.Price {
+			return resting
+		}
+	}
+	return nil
+}
+
 func matchOrder(order *Order) int64 {
 	execType := normalizeExecutionType(order.ExecutionType)
 	var filledQty int64 = 0
@@ -1018,6 +1137,9 @@ func matchOrder(order *Order) int64 {
 		}
 		trades = append(trades, newTrade)
 
+		// Broadcast the trade to WebSocket clients
+		broadcastTrade(newTrade)
+
 		// Apply balance changes: buyer pays, seller receives
 		amount := tradePrice * tradeQty
 		balances[buyerID] -= amount
@@ -1049,6 +1171,28 @@ func randInt() int {
 	b := make([]byte, 4)
 	rand.Read(b)
 	return int(binary.BigEndian.Uint32(b))
+}
+
+func broadcastTrade(t *Trade) {
+	if t.Version != 2 {
+		return
+	}
+	tradeMsg := map[string]GValue{
+		"trade_id":       t.ID,
+		"buyer_id":       t.BuyerID,
+		"seller_id":      t.SellerID,
+		"price":          t.Price,
+		"quantity":       t.Quantity,
+		"delivery_start": t.DeliveryStart,
+		"delivery_end":   t.DeliveryEnd,
+		"timestamp":      t.Timestamp,
+	}
+	encoded, err := EncodeMessage(tradeMsg)
+	if err != nil {
+		log.Printf("failed to encode trade for broadcast: %v", err)
+		return
+	}
+	hub.broadcast <- encoded
 }
 
 // V2 Orders Handler (Matching Engine + Order Book)
@@ -1176,76 +1320,25 @@ func ordersV2Handler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		if side != "buy" && side != "sell" {
-			http.Error(w, "Invalid side", http.StatusBadRequest)
-			return
-		}
-
-		if quantity <= 0 {
-			http.Error(w, "Quantity must be positive", http.StatusBadRequest)
-			return
-		}
-		const hourMs = 3600000
-		if start%hourMs != 0 || end%hourMs != 0 || end <= start || (end-start) != hourMs {
-			http.Error(w, "Invalid Contract Timestamps", http.StatusBadRequest)
-			return
-		}
-		status := contractTradingWindowStatus(start, nowFunc())
-		if status < 0 {
-			http.Error(w, "Contract not open", http.StatusTooEarly)
-			return
-		}
-		if status > 0 {
-			http.Error(w, "Contract closed", http.StatusUnavailableForLegalReasons)
-			return
-		}
-
-		mu.Lock()
-		defer mu.Unlock()
-
-		orderCounter++
-		orderID := fmt.Sprintf("ord-v2-%d", orderCounter)
-		now := nowMillis()
-
-		newOrder := &Order{
-			ID:            orderID,
+		payload := orderSubmitPayload{
+			Side:          side,
 			Price:         price,
 			Quantity:      quantity,
 			DeliveryStart: start,
 			DeliveryEnd:   end,
-			Owner:         username,
-			Status:        "ACTIVE",
-			Side:          side,
-			Version:       2,
-			Timestamp:     now,
 			ExecutionType: execType,
 		}
 
-		// Collateral check (only if this order can reduce balance)
-		if orderRequiresCollateral(newOrder) {
-			coll := getUserCollateralLocked(username)
-			if coll < 0 {
-				coll = 0
-			}
-			potential := computePotentialBalanceLocked(username, newOrder)
-			if potential < -coll {
-				http.Error(w, "Insufficient collateral", http.StatusPaymentRequired)
-				return
-			}
+		result, apiErr := createOrderV2(username, payload)
+		if apiErr != nil {
+			http.Error(w, apiErr.message, apiErr.status)
+			return
 		}
-
-		// Trigger Matching
-		filledQty := matchOrder(newOrder)
-
-		if execType == ExecutionTypeGTC && newOrder.Status == "ACTIVE" {
-			orders[orderID] = newOrder
-		}
-		persistStateLocked()
 
 		resp := map[string]GValue{
-			"order_id":        orderID,
-			"status":          newOrder.Status,
-			"filled_quantity": filledQty,
+			"order_id":        result.OrderID,
+			"status":          result.Status,
+			"filled_quantity": result.FilledQuantity,
 		}
 		encoded, _ := EncodeMessage(resp)
 		w.Header().Set("Content-Type", "application/x-galacticbuf")
@@ -1257,24 +1350,22 @@ func ordersV2Handler(w http.ResponseWriter, r *http.Request) {
 }
 
 func orderOperationHandler(w http.ResponseWriter, r *http.Request) {
-	id := r.URL.Path[len("/v2/orders/"):]
-	if id == "" {
+	id := strings.TrimPrefix(r.URL.Path, "/v2/orders/")
+	if id == "" || id == "/" {
 		ordersV2Handler(w, r)
 		return
 	}
 
-	if r.Method == http.MethodPut {
+	switch r.Method {
+	case http.MethodPut:
 		modifyOrderHandler(w, r, id)
-		return
-	}
-	if r.Method == http.MethodDelete {
+	case http.MethodDelete:
 		cancelOrderHandler(w, r, id)
-		return
+	default:
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 	}
-	http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 }
 
-// Modify Order: Update logic and re-trigger matching if necessary
 func modifyOrderHandler(w http.ResponseWriter, r *http.Request, orderID string) {
 	username, authOk := getUserFromToken(r)
 	if !authOk {
@@ -1294,83 +1385,17 @@ func modifyOrderHandler(w http.ResponseWriter, r *http.Request, orderID string) 
 		http.Error(w, "Missing fields", http.StatusBadRequest)
 		return
 	}
-	if quantity <= 0 {
-		http.Error(w, "Quantity must be positive", http.StatusBadRequest)
+
+	result, apiErr := modifyOrderInternal(username, orderModifyPayload{OrderID: orderID, Price: price, Quantity: quantity})
+	if apiErr != nil {
+		http.Error(w, apiErr.message, apiErr.status)
 		return
 	}
-
-	mu.Lock()
-	defer mu.Unlock()
-
-	order, exists := orders[orderID]
-	if !exists || order.Status == "CANCELLED" {
-		http.Error(w, "Order not found", http.StatusNotFound)
-		return
-	}
-	if order.Status == "FILLED" {
-		http.Error(w, "Order is fully filled", http.StatusNotFound)
-		return
-	}
-	if order.Owner != username {
-		http.Error(w, "Forbidden", http.StatusForbidden)
-		return
-	}
-	if order.Version != 2 {
-		http.Error(w, "Order not found", http.StatusNotFound)
-		return
-	}
-
-	// Determine if priority reset is needed
-	resetPriority := false
-	if price != order.Price {
-		resetPriority = true
-	}
-	if quantity > order.Quantity {
-		resetPriority = true
-	}
-
-	// Save old values in case we need to revert
-	oldPrice, oldQty, oldStatus := order.Price, order.Quantity, order.Status
-
-	// Apply new values
-	order.Price = price
-	order.Quantity = quantity
-	order.Status = "ACTIVE"
-
-	// Collateral check (only if this modified order can reduce balance)
-	if orderRequiresCollateral(order) {
-		coll := getUserCollateralLocked(username)
-		if coll < 0 {
-			coll = 0
-		}
-		potential := computePotentialBalanceLocked(username, nil)
-		if potential < -coll {
-			// revert
-			order.Price = oldPrice
-			order.Quantity = oldQty
-			order.Status = oldStatus
-			http.Error(w, "Insufficient collateral", http.StatusPaymentRequired)
-			return
-		}
-	}
-
-	// Update priority timestamp if needed
-	if resetPriority {
-		now := time.Now().UnixMilli()
-		if now <= order.Timestamp {
-			now = order.Timestamp + 1
-		}
-		order.Timestamp = now
-	}
-
-	// Re-run matching
-	filledQty := matchOrder(order)
-	persistStateLocked()
 
 	resp := map[string]GValue{
-		"order_id":        orderID,
-		"status":          order.Status,
-		"filled_quantity": filledQty,
+		"order_id":        result.OrderID,
+		"status":          result.Status,
+		"filled_quantity": result.FilledQuantity,
 	}
 	encoded, _ := EncodeMessage(resp)
 	w.Header().Set("Content-Type", "application/x-galacticbuf")
@@ -1384,30 +1409,158 @@ func cancelOrderHandler(w http.ResponseWriter, r *http.Request, orderID string) 
 		return
 	}
 
+	if err := cancelOrderInternal(username, orderCancelPayload{OrderID: orderID}); err != nil {
+		http.Error(w, err.message, err.status)
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func createOrderV2(username string, payload orderSubmitPayload) (*orderSubmitResult, *apiError) {
+	if payload.Side != "buy" && payload.Side != "sell" {
+		return nil, newAPIError(http.StatusBadRequest, "Invalid side")
+	}
+	if payload.Quantity <= 0 {
+		return nil, newAPIError(http.StatusBadRequest, "Quantity must be positive")
+	}
+	const hourMs = 3600000
+	if payload.DeliveryStart%hourMs != 0 || payload.DeliveryEnd%hourMs != 0 || payload.DeliveryEnd <= payload.DeliveryStart || (payload.DeliveryEnd-payload.DeliveryStart) != hourMs {
+		return nil, newAPIError(http.StatusBadRequest, "Invalid Contract Timestamps")
+	}
+	status := contractTradingWindowStatus(payload.DeliveryStart, nowFunc())
+	if status < 0 {
+		return nil, newAPIError(http.StatusTooEarly, "Contract not open")
+	}
+	if status > 0 {
+		return nil, newAPIError(http.StatusUnavailableForLegalReasons, "Contract closed")
+	}
+
 	mu.Lock()
 	defer mu.Unlock()
 
-	order, exists := orders[orderID]
-	if !exists || order.Status == "CANCELLED" {
-		http.Error(w, "Order not found", http.StatusNotFound)
-		return
+	orderCounter++
+	orderID := fmt.Sprintf("ord-v2-%d", orderCounter)
+	now := nowMillis()
+
+	newOrder := &Order{
+		ID:            orderID,
+		Price:         payload.Price,
+		Quantity:      payload.Quantity,
+		DeliveryStart: payload.DeliveryStart,
+		DeliveryEnd:   payload.DeliveryEnd,
+		Owner:         username,
+		Status:        "ACTIVE",
+		Side:          payload.Side,
+		Version:       2,
+		Timestamp:     now,
+		ExecutionType: payload.ExecutionType,
 	}
-	if order.Status == "FILLED" {
-		http.Error(w, "Order is fully filled", http.StatusNotFound)
-		return
+
+	if conflict := detectSelfMatchLocked(newOrder); conflict != nil {
+		return nil, newAPIError(http.StatusPreconditionFailed, "Self-match prevented")
+	}
+
+	if orderRequiresCollateral(newOrder) {
+		coll := getUserCollateralLocked(username)
+		if coll < 0 {
+			coll = 0
+		}
+		potential := computePotentialBalanceLocked(username, newOrder)
+		if potential < -coll {
+			return nil, newAPIError(http.StatusPaymentRequired, "Insufficient collateral")
+		}
+	}
+
+	filledQty := matchOrder(newOrder)
+
+	if payload.ExecutionType == ExecutionTypeGTC && newOrder.Status == "ACTIVE" {
+		orders[orderID] = newOrder
+	}
+	persistStateLocked()
+
+	return &orderSubmitResult{OrderID: orderID, Status: newOrder.Status, FilledQuantity: filledQty}, nil
+}
+
+func modifyOrderInternal(username string, payload orderModifyPayload) (*orderModifyResult, *apiError) {
+	if payload.Quantity <= 0 {
+		return nil, newAPIError(http.StatusBadRequest, "Quantity must be positive")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	order, exists := orders[payload.OrderID]
+	if !exists || order.Status == "CANCELLED" || order.Status == "FILLED" || order.Version != 2 {
+		return nil, newAPIError(http.StatusNotFound, "Order not found")
 	}
 	if order.Owner != username {
-		http.Error(w, "Forbidden", http.StatusForbidden)
-		return
+		return nil, newAPIError(http.StatusForbidden, "Forbidden")
 	}
-	if order.Version != 2 {
-		http.Error(w, "Order not found", http.StatusNotFound)
-		return
+	if payload.EnforceContract && (order.DeliveryStart != payload.ExpectedStart || order.DeliveryEnd != payload.ExpectedEnd) {
+		return nil, newAPIError(http.StatusBadRequest, "Contract mismatch")
+	}
+
+	resetPriority := payload.Price != order.Price || payload.Quantity > order.Quantity
+	oldPrice, oldQty, oldStatus := order.Price, order.Quantity, order.Status
+
+	order.Price = payload.Price
+	order.Quantity = payload.Quantity
+	order.Status = "ACTIVE"
+
+	if conflict := detectSelfMatchLocked(order); conflict != nil {
+		order.Price = oldPrice
+		order.Quantity = oldQty
+		order.Status = oldStatus
+		return nil, newAPIError(http.StatusPreconditionFailed, "Self-match prevented")
+	}
+
+	if orderRequiresCollateral(order) {
+		coll := getUserCollateralLocked(username)
+		if coll < 0 {
+			coll = 0
+		}
+		potential := computePotentialBalanceLocked(username, nil)
+		if potential < -coll {
+			order.Price = oldPrice
+			order.Quantity = oldQty
+			order.Status = oldStatus
+			return nil, newAPIError(http.StatusPaymentRequired, "Insufficient collateral")
+		}
+	}
+
+	if resetPriority {
+		now := time.Now().UnixMilli()
+		if now <= order.Timestamp {
+			now = order.Timestamp + 1
+		}
+		order.Timestamp = now
+	}
+
+	filledQty := matchOrder(order)
+	persistStateLocked()
+
+	return &orderModifyResult{OrderID: payload.OrderID, Status: order.Status, FilledQuantity: filledQty}, nil
+}
+
+func cancelOrderInternal(username string, payload orderCancelPayload) *apiError {
+	mu.Lock()
+	defer mu.Unlock()
+
+	order, exists := orders[payload.OrderID]
+	if !exists || order.Status == "CANCELLED" || order.Status == "FILLED" || order.Version != 2 {
+		return newAPIError(http.StatusNotFound, "Order not found")
+	}
+	if order.Owner != username {
+		return newAPIError(http.StatusForbidden, "Forbidden")
+	}
+	if payload.EnforceContract && (order.DeliveryStart != payload.ExpectedStart || order.DeliveryEnd != payload.ExpectedEnd) {
+		return newAPIError(http.StatusBadRequest, "Contract mismatch")
 	}
 
 	order.Status = "CANCELLED"
 	persistStateLocked()
-	w.WriteHeader(http.StatusNoContent)
+	return nil
 }
 
 func tradesHandler(w http.ResponseWriter, r *http.Request) {
@@ -1783,7 +1936,61 @@ func myOrdersHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write(encoded)
 }
 
+// --- API Error Handling ---
+
+type apiError struct {
+	status  int
+	message string
+}
+
+func (e *apiError) Error() string {
+	return e.message
+}
+
+func newAPIError(status int, msg string) *apiError {
+	return &apiError{status: status, message: msg}
+}
+
+// orderSubmitPayload mirrors POST /v2/orders inputs.
+type orderSubmitPayload struct {
+	Side          string
+	Price         int64
+	Quantity      int64
+	DeliveryStart int64
+	DeliveryEnd   int64
+	ExecutionType string
+}
+
+type orderSubmitResult struct {
+	OrderID        string
+	Status         string
+	FilledQuantity int64
+}
+
+type orderModifyPayload struct {
+	OrderID         string
+	Price           int64
+	Quantity        int64
+	ExpectedStart   int64
+	ExpectedEnd     int64
+	EnforceContract bool
+}
+
+type orderModifyResult struct {
+	OrderID        string
+	Status         string
+	FilledQuantity int64
+}
+
+type orderCancelPayload struct {
+	OrderID         string
+	ExpectedStart   int64
+	ExpectedEnd     int64
+	EnforceContract bool
+}
+
 func main() {
+	go hub.run()
 	setupPersistenceFromEnv()
 
 	mux := http.NewServeMux()
@@ -1799,6 +2006,7 @@ func main() {
 	mux.HandleFunc("/v2/orders", ordersV2Handler)
 	mux.HandleFunc("/v2/orders/", orderOperationHandler)
 	mux.HandleFunc("/v2/my-orders", myOrdersHandler)
+	mux.HandleFunc("/v2/stream/trades", tradeStreamHandler)
 
 	mux.HandleFunc("/trades", tradesHandler)
 	mux.HandleFunc("/v2/trades", tradesV2Handler)
