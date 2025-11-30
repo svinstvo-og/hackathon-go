@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -18,6 +20,8 @@ func resetState() {
 	orders = make(map[string]*Order)
 	trades = make([]*Trade, 0)
 	orderCounter = 0
+	balances = make(map[string]int64)
+	collaterals = make(map[string]int64)
 }
 
 func addOrder(o *Order) {
@@ -59,10 +63,7 @@ func TestOrdersV2Get_OrderBookSortingAndFilters(t *testing.T) {
 		t.Fatalf("expected status 200, got %d", rr.Code)
 	}
 
-	resp, err := DecodeMessage(rr.Body)
-	if err != nil {
-		t.Fatalf("failed to decode response: %v", err)
-	}
+	resp := decodeBody(t, rr.Body)
 
 	rawBids, ok := resp["bids"].([]GValue)
 	if !ok {
@@ -150,9 +151,7 @@ func TestModifyOrder_PriorityAndMatching(t *testing.T) {
 
 	// 2. Modify buy1 price to 100 -> Should match sell1
 	reqBody := map[string]GValue{"price": int64(100), "quantity": int64(10)}
-	encoded, _ := EncodeMessage(reqBody)
-
-	req := httptest.NewRequest(http.MethodPut, "/v2/orders/buy1", bytes.NewReader(encoded))
+	req := newRequest(t, http.MethodPut, "/v2/orders/buy1", reqBody)
 	req.Header.Set("Authorization", "Bearer tok1")
 	rr := httptest.NewRecorder()
 
@@ -194,8 +193,7 @@ func TestModifyOrder_PriorityReset(t *testing.T) {
 	mux.HandleFunc("/v2/orders/", orderOperationHandler)
 
 	// Case 1: Decrease Quantity -> Priority Preserved
-	body1, _ := EncodeMessage(map[string]GValue{"price": int64(100), "quantity": int64(5)})
-	req1 := httptest.NewRequest(http.MethodPut, "/v2/orders/o1", bytes.NewReader(body1))
+	req1 := newRequest(t, http.MethodPut, "/v2/orders/o1", map[string]GValue{"price": int64(100), "quantity": int64(5)})
 	req1.Header.Set("Authorization", "Bearer tok")
 	rr1 := httptest.NewRecorder()
 	mux.ServeHTTP(rr1, req1)
@@ -207,8 +205,7 @@ func TestModifyOrder_PriorityReset(t *testing.T) {
 	mu.Unlock()
 
 	// Case 2: Increase Quantity -> Priority Reset
-	body2, _ := EncodeMessage(map[string]GValue{"price": int64(100), "quantity": int64(20)})
-	req2 := httptest.NewRequest(http.MethodPut, "/v2/orders/o1", bytes.NewReader(body2))
+	req2 := newRequest(t, http.MethodPut, "/v2/orders/o1", map[string]GValue{"price": int64(100), "quantity": int64(20)})
 	req2.Header.Set("Authorization", "Bearer tok")
 	rr2 := httptest.NewRecorder()
 	mux.ServeHTTP(rr2, req2)
@@ -222,8 +219,7 @@ func TestModifyOrder_PriorityReset(t *testing.T) {
 
 	// Case 3: Change Price -> Priority Reset
 	time.Sleep(1 * time.Millisecond) // Ensure time advances
-	body3, _ := EncodeMessage(map[string]GValue{"price": int64(101), "quantity": int64(20)})
-	req3 := httptest.NewRequest(http.MethodPut, "/v2/orders/o1", bytes.NewReader(body3))
+	req3 := newRequest(t, http.MethodPut, "/v2/orders/o1", map[string]GValue{"price": int64(101), "quantity": int64(20)})
 	req3.Header.Set("Authorization", "Bearer tok")
 	rr3 := httptest.NewRecorder()
 	mux.ServeHTTP(rr3, req3)
@@ -288,7 +284,7 @@ func TestTradesV2Handler_Success(t *testing.T) {
 	)
 	mu.Unlock()
 
-	req := httptest.NewRequest(http.MethodGet, "/v2/trades?delivery_start=180000000&delivery_end=183600000", nil)
+	req := newRequestWithContract(t, http.MethodGet, "/v2/trades", start, end, true)
 	rr := httptest.NewRecorder()
 	tradesV2Handler(rr, req)
 
@@ -296,10 +292,7 @@ func TestTradesV2Handler_Success(t *testing.T) {
 		t.Fatalf("expected 200, got %d", rr.Code)
 	}
 
-	resp, err := DecodeMessage(rr.Body)
-	if err != nil {
-		t.Fatalf("decode failed: %v", err)
-	}
+	resp := decodeBody(t, rr.Body)
 
 	rawTrades, ok := resp["trades"].([]GValue)
 	if !ok {
@@ -335,10 +328,46 @@ func TestTradesV2Handler_InvalidParams(t *testing.T) {
 		t.Fatalf("expected 400 for missing params, got %d", rr.Code)
 	}
 
-	reqBad := httptest.NewRequest(http.MethodGet, "/v2/trades?delivery_start=1&delivery_end=2", nil)
+	reqBad := newRequestWithContract(t, http.MethodGet, "/v2/trades", 1, 3660000, false)
 	rrBad := httptest.NewRecorder()
 	tradesV2Handler(rrBad, reqBad)
 	if rrBad.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 for unaligned params, got %d", rrBad.Code)
 	}
+}
+
+func mustEncode(t *testing.T, body map[string]GValue) []byte {
+	t.Helper()
+	b, err := EncodeMessage(body)
+	if err != nil {
+		t.Fatalf("encode failed: %v", err)
+	}
+	return b
+}
+
+func decodeBody(t *testing.T, body io.Reader) map[string]GValue {
+	t.Helper()
+	resp, err := DecodeMessage(body)
+	if err != nil {
+		t.Fatalf("decode failed: %v", err)
+	}
+	return resp
+}
+
+func newRequest(t *testing.T, method, target string, body map[string]GValue) *http.Request {
+	t.Helper()
+	var reader io.Reader
+	if body != nil {
+		reader = bytes.NewReader(mustEncode(t, body))
+	}
+	return httptest.NewRequest(method, target, reader)
+}
+
+func newRequestWithContract(t *testing.T, method, path string, start, end int64, enforce bool) *http.Request {
+	const hourMs = 3600000
+	if enforce && (start%hourMs != 0 || end-start != hourMs) {
+		t.Fatalf("contract not aligned: %d-%d", start, end)
+	}
+	t.Helper()
+	return httptest.NewRequest(method, fmt.Sprintf("%s?delivery_start=%d&delivery_end=%d", path, start, end), nil)
 }

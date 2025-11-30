@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -42,18 +43,20 @@ type Trade struct {
 	Price         int64
 	Quantity      int64
 	Timestamp     int64
-	DeliveryStart int64 // Added for filtering
-	DeliveryEnd   int64 // Added for filtering
+	DeliveryStart int64
+	DeliveryEnd   int64
 	Version       int
 }
 
 var (
 	mu           sync.RWMutex
-	users        = make(map[string]User)
-	tokens       = make(map[string]string)
-	dnaSamples   = make(map[string][]string)
-	orders       = make(map[string]*Order)
-	trades       = make([]*Trade, 0)
+	users              = make(map[string]User)
+	tokens             = make(map[string]string)
+	dnaSamples         = make(map[string][]string)
+	orders             = make(map[string]*Order)
+	trades             = make([]*Trade, 0)
+	balances           = make(map[string]int64) // actual credit balances
+	collaterals        = make(map[string]int64) // max allowed negative balance
 	orderCounter int64 = 0
 )
 
@@ -69,6 +72,9 @@ const (
 	TypeObject = 0x04
 	TypeBytes  = 0x05
 )
+
+// default "unlimited" collateral (very large number)
+const UnlimitedCollateral int64 = 1<<62 - 1
 
 type GValue interface{}
 
@@ -473,6 +479,66 @@ func codonEditDistanceBounded(a, b []string, limit int) int {
 	return limit + 1
 }
 
+// cashflowForOrder returns the net balance change if this order is fully filled.
+// Positive = balance increases, Negative = balance decreases.
+// Must be called with mu locked.
+func cashflowForOrder(o *Order) int64 {
+	if o.Quantity <= 0 {
+		return 0
+	}
+	if o.Side == "buy" {
+		// Buyer pays price * qty
+		return -o.Price * o.Quantity
+	}
+	// Seller receives price * qty
+	return o.Price * o.Quantity
+}
+
+// orderRequiresCollateral returns true if placing this order can *reduce* balance
+// and therefore must pass the collateral check.
+func orderRequiresCollateral(o *Order) bool {
+	if o.Side == "buy" && o.Price > 0 {
+		return true
+	}
+	if o.Side == "sell" && o.Price < 0 {
+		return true
+	}
+	return false
+}
+
+// computePotentialBalanceLocked calculates balance after all active orders are
+// hypothetically fully filled (plus an optional extra order).
+// mu must already be locked (RLock or Lock).
+func computePotentialBalanceLocked(username string, extra *Order) int64 {
+	bal := balances[username]
+
+	for _, o := range orders {
+		if o.Owner != username {
+			continue
+		}
+		if o.Status != "ACTIVE" && o.Status != "OPEN" {
+			continue
+		}
+		bal += cashflowForOrder(o)
+	}
+
+	if extra != nil {
+		bal += cashflowForOrder(extra)
+	}
+
+	return bal
+}
+
+// getUserCollateralLocked returns the user's collateral limit,
+// defaulting to UnlimitedCollateral if not explicitly set.
+// mu must be locked.
+func getUserCollateralLocked(username string) int64 {
+	if c, ok := collaterals[username]; ok {
+		return c
+	}
+	return UnlimitedCollateral
+}
+
 // --- HTTP Handlers ---
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
@@ -500,6 +566,8 @@ func registerHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	users[username] = User{Username: username, Password: password}
+	balances[username] = 0
+	collaterals[username] = UnlimitedCollateral
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -793,7 +861,7 @@ func matchOrder(order *Order) int64 {
 
 	// 1. Identify compatible orders
 	for _, o := range orders {
-		// Compatible if V2, Active OR Open (legacy compat), and Contract matches
+		// Compatible if V2, Active/Open, and contract matches
 		isCompatibleStatus := (o.Status == "ACTIVE" || o.Status == "OPEN")
 		if o.Version == 2 && isCompatibleStatus &&
 			o.DeliveryStart == order.DeliveryStart && o.DeliveryEnd == order.DeliveryEnd {
@@ -842,7 +910,7 @@ func matchOrder(order *Order) int64 {
 			tradeQty = matchOrder.Quantity
 		}
 
-		// Trade Price is always the Maker's (Resting) price
+		// Trade Price is always the maker's (resting) price
 		tradePrice := matchOrder.Price
 
 		var buyerID, sellerID string
@@ -862,11 +930,16 @@ func matchOrder(order *Order) int64 {
 			Price:         tradePrice,
 			Quantity:      tradeQty,
 			Timestamp:     now,
-			DeliveryStart: order.DeliveryStart, // Populate Contract Info
-			DeliveryEnd:   order.DeliveryEnd,   // Populate Contract Info
+			DeliveryStart: order.DeliveryStart,
+			DeliveryEnd:   order.DeliveryEnd,
 			Version:       2,
 		}
 		trades = append(trades, newTrade)
+
+		// Apply balance changes: buyer pays, seller receives
+		amount := tradePrice * tradeQty
+		balances[buyerID] -= amount
+		balances[sellerID] += amount
 
 		// Update Quantities
 		order.Quantity -= tradeQty
@@ -1019,6 +1092,8 @@ func ordersV2Handler(w http.ResponseWriter, r *http.Request) {
 		}
 
 		mu.Lock()
+		defer mu.Unlock()
+
 		orderCounter++
 		orderID := fmt.Sprintf("ord-v2-%d", orderCounter)
 		now := time.Now().UnixMilli()
@@ -1036,6 +1111,19 @@ func ordersV2Handler(w http.ResponseWriter, r *http.Request) {
 			Timestamp:     now,
 		}
 
+		// Collateral check (only if this order can reduce balance)
+		if orderRequiresCollateral(newOrder) {
+			coll := getUserCollateralLocked(username)
+			if coll < 0 {
+				coll = 0
+			}
+			potential := computePotentialBalanceLocked(username, newOrder)
+			if potential < -coll {
+				http.Error(w, "Insufficient collateral", http.StatusPaymentRequired)
+				return
+			}
+		}
+
 		// Trigger Matching
 		filledQty := matchOrder(newOrder)
 
@@ -1043,7 +1131,6 @@ func ordersV2Handler(w http.ResponseWriter, r *http.Request) {
 		if newOrder.Status != "FILLED" {
 			orders[orderID] = newOrder
 		}
-		mu.Unlock()
 
 		resp := map[string]GValue{
 			"order_id":        orderID,
@@ -1123,7 +1210,7 @@ func modifyOrderHandler(w http.ResponseWriter, r *http.Request, orderID string) 
 		return
 	}
 
-	// Update Logic & Priority Check
+	// Determine if priority reset is needed
 	resetPriority := false
 	if price != order.Price {
 		resetPriority = true
@@ -1132,21 +1219,41 @@ func modifyOrderHandler(w http.ResponseWriter, r *http.Request, orderID string) 
 		resetPriority = true
 	}
 
+	// Save old values in case we need to revert
+	oldPrice, oldQty, oldStatus := order.Price, order.Quantity, order.Status
+
+	// Apply new values
 	order.Price = price
 	order.Quantity = quantity
-	// Ensure status is up to date (in case it was OPEN)
 	order.Status = "ACTIVE"
 
+	// Collateral check (only if this modified order can reduce balance)
+	if orderRequiresCollateral(order) {
+		coll := getUserCollateralLocked(username)
+		if coll < 0 {
+			coll = 0
+		}
+		potential := computePotentialBalanceLocked(username, nil)
+		if potential < -coll {
+			// revert
+			order.Price = oldPrice
+			order.Quantity = oldQty
+			order.Status = oldStatus
+			http.Error(w, "Insufficient collateral", http.StatusPaymentRequired)
+			return
+		}
+	}
+
+	// Update priority timestamp if needed
 	if resetPriority {
 		now := time.Now().UnixMilli()
-		// Ensure timestamp moves forward to lose priority
 		if now <= order.Timestamp {
 			now = order.Timestamp + 1
 		}
 		order.Timestamp = now
 	}
 
-	// Re-run matching because the modified order acts like a new "Taker"
+	// Re-run matching
 	filledQty := matchOrder(order)
 
 	resp := map[string]GValue{
@@ -1315,6 +1422,11 @@ func tradesHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		trades = append(trades, newTrade)
 
+		// Apply balance changes
+		amount := order.Price * order.Quantity
+		balances[buyerUser] -= amount
+		balances[order.Owner] += amount
+
 		resp := map[string]GValue{"trade_id": tradeID}
 		encoded, _ := EncodeMessage(resp)
 		w.Header().Set("Content-Type", "application/x-galacticbuf")
@@ -1421,7 +1533,6 @@ func myTradesHandler(w http.ResponseWriter, r *http.Request) {
 
 	mu.RLock()
 	var resultTrades []map[string]GValue
-	// Copy relevant trades to temporary slice to sort later
 	var myTrades []*Trade
 
 	for _, t := range trades {
@@ -1473,6 +1584,87 @@ func myTradesHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write(encoded)
 }
 
+// PUT /collateral/{username}  (admin-only: Bearer password123)
+func collateralHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPut {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	authHeader := r.Header.Get("Authorization")
+	if authHeader != "Bearer password123" {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	username := strings.TrimPrefix(r.URL.Path, "/collateral/")
+	if username == "" {
+		http.Error(w, "Not Found", http.StatusNotFound)
+		return
+	}
+
+	data, err := DecodeMessage(r.Body)
+	if err != nil {
+		http.Error(w, "Bad Request", http.StatusBadRequest)
+		return
+	}
+	coll, ok := data["collateral"].(int64)
+	if !ok {
+		http.Error(w, "Bad Request", http.StatusBadRequest)
+		return
+	}
+	if coll < 0 {
+		coll = 0
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if _, exists := users[username]; !exists {
+		http.Error(w, "Not Found", http.StatusNotFound)
+		return
+	}
+
+	collaterals[username] = coll
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// GET /balance - user balance, potential balance, collateral
+func balanceHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	username, ok := getUserFromToken(r)
+	if !ok {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	mu.RLock()
+	_, exists := users[username]
+	if !exists {
+		mu.RUnlock()
+		http.Error(w, "Not Found", http.StatusNotFound)
+		return
+	}
+
+	bal := balances[username]
+	coll := getUserCollateralLocked(username)
+	potential := computePotentialBalanceLocked(username, nil)
+	mu.RUnlock()
+
+	resp := map[string]GValue{
+		"balance":           bal,
+		"potential_balance": potential,
+		"collateral":        coll,
+	}
+	encoded, _ := EncodeMessage(resp)
+	w.Header().Set("Content-Type", "application/x-galacticbuf")
+	w.Write(encoded)
+}
+
 func loggingMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		log.Printf("%s %s", r.Method, r.URL.String())
@@ -1498,6 +1690,9 @@ func main() {
 	mux.HandleFunc("/trades", tradesHandler)
 	mux.HandleFunc("/v2/trades", tradesV2Handler)
 	mux.HandleFunc("/v2/my-trades", myTradesHandler)
+
+	mux.HandleFunc("/collateral/", collateralHandler)
+	mux.HandleFunc("/balance", balanceHandler)
 
 	log.Println("Galactic Exchange started on :8080")
 	if err := http.ListenAndServe(":8080", loggingMiddleware(mux.ServeHTTP)); err != nil {
