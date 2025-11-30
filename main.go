@@ -60,6 +60,14 @@ var (
 	orderCounter int64 = 0
 )
 
+var nowFunc = func() time.Time {
+	return time.Now().UTC()
+}
+
+func nowMillis() int64 {
+	return nowFunc().UnixMilli()
+}
+
 // --- GalacticBuf Protocol Constants ---
 
 const (
@@ -539,6 +547,27 @@ func getUserCollateralLocked(username string) int64 {
 	return UnlimitedCollateral
 }
 
+func contractTradingWindow(startMs int64) (openMs, closeMs int64) {
+	start := time.UnixMilli(startMs).UTC()
+	year, month, day := start.Date()
+	midnight := time.Date(year, month, day, 0, 0, 0, 0, time.UTC)
+	open := midnight.AddDate(0, 0, -15)
+	close := start.Add(-time.Minute)
+	return open.UnixMilli(), close.UnixMilli()
+}
+
+func contractTradingWindowStatus(startMs int64, now time.Time) int {
+	open, close := contractTradingWindow(startMs)
+	nowMs := now.UTC().UnixMilli()
+	if nowMs < open {
+		return -1
+	}
+	if nowMs > close {
+		return 1
+	}
+	return 0
+}
+
 // --- HTTP Handlers ---
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
@@ -568,6 +597,7 @@ func registerHandler(w http.ResponseWriter, r *http.Request) {
 	users[username] = User{Username: username, Password: password}
 	balances[username] = 0
 	collaterals[username] = UnlimitedCollateral
+	persistStateLocked()
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -634,7 +664,7 @@ func passwordHandler(w http.ResponseWriter, r *http.Request) {
 			delete(tokens, token)
 		}
 	}
-
+	persistStateLocked()
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -680,6 +710,7 @@ func dnaSubmitHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	dnaSamples[username] = append(existing, dna)
+	persistStateLocked()
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -840,7 +871,7 @@ func ordersV1Handler(w http.ResponseWriter, r *http.Request) {
 			Status:        "OPEN", // V1 legacy status
 			Side:          "sell",
 			Version:       1,
-			Timestamp:     time.Now().UnixMilli(),
+			Timestamp:     nowMillis(),
 		}
 		orders[orderID] = newOrder
 		mu.Unlock()
@@ -989,6 +1020,13 @@ func ordersV2Handler(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "Invalid Contract Timestamps", http.StatusBadRequest)
 			return
 		}
+		if contractTradingWindowStatus(start, nowFunc()) != 0 {
+			resp := map[string]GValue{"bids": []map[string]GValue{}, "asks": []map[string]GValue{}}
+			encoded, _ := EncodeMessage(resp)
+			w.Header().Set("Content-Type", "application/x-galacticbuf")
+			w.Write(encoded)
+			return
+		}
 
 		mu.RLock()
 		var bids []*Order
@@ -1090,13 +1128,22 @@ func ordersV2Handler(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "Invalid Contract Timestamps", http.StatusBadRequest)
 			return
 		}
+		status := contractTradingWindowStatus(start, nowFunc())
+		if status < 0 {
+			http.Error(w, "Contract not open", http.StatusTooEarly)
+			return
+		}
+		if status > 0 {
+			http.Error(w, "Contract closed", http.StatusUnavailableForLegalReasons)
+			return
+		}
 
 		mu.Lock()
 		defer mu.Unlock()
 
 		orderCounter++
 		orderID := fmt.Sprintf("ord-v2-%d", orderCounter)
-		now := time.Now().UnixMilli()
+		now := nowMillis()
 
 		newOrder := &Order{
 			ID:            orderID,
@@ -1131,6 +1178,7 @@ func ordersV2Handler(w http.ResponseWriter, r *http.Request) {
 		if newOrder.Status != "FILLED" {
 			orders[orderID] = newOrder
 		}
+		persistStateLocked()
 
 		resp := map[string]GValue{
 			"order_id":        orderID,
@@ -1255,6 +1303,7 @@ func modifyOrderHandler(w http.ResponseWriter, r *http.Request, orderID string) 
 
 	// Re-run matching
 	filledQty := matchOrder(order)
+	persistStateLocked()
 
 	resp := map[string]GValue{
 		"order_id":        orderID,
@@ -1295,54 +1344,8 @@ func cancelOrderHandler(w http.ResponseWriter, r *http.Request, orderID string) 
 	}
 
 	order.Status = "CANCELLED"
+	persistStateLocked()
 	w.WriteHeader(http.StatusNoContent)
-}
-
-func myOrdersHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	username, authOk := getUserFromToken(r)
-	if !authOk {
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
-		return
-	}
-
-	mu.RLock()
-	var myOrders []*Order
-	// Filter: Own orders + Status ACTIVE or OPEN
-	for _, o := range orders {
-		isCompatible := (o.Status == "ACTIVE" || o.Status == "OPEN")
-		if o.Owner == username && isCompatible {
-			myOrders = append(myOrders, o)
-		}
-	}
-	mu.RUnlock()
-
-	// Sort: Newest First
-	sort.Slice(myOrders, func(i, j int) bool {
-		return myOrders[i].Timestamp > myOrders[j].Timestamp
-	})
-
-	list := make([]map[string]GValue, 0, len(myOrders))
-	for _, o := range myOrders {
-		list = append(list, map[string]GValue{
-			"order_id":       o.ID,
-			"side":           o.Side,
-			"price":          o.Price,
-			"quantity":       o.Quantity,
-			"delivery_start": o.DeliveryStart,
-			"delivery_end":   o.DeliveryEnd,
-			"timestamp":      o.Timestamp,
-		})
-	}
-
-	resp := map[string]GValue{"orders": list}
-	encoded, _ := EncodeMessage(resp)
-	w.Header().Set("Content-Type", "application/x-galacticbuf")
-	w.Write(encoded)
 }
 
 func tradesHandler(w http.ResponseWriter, r *http.Request) {
@@ -1426,6 +1429,7 @@ func tradesHandler(w http.ResponseWriter, r *http.Request) {
 		amount := order.Price * order.Quantity
 		balances[buyerUser] -= amount
 		balances[order.Owner] += amount
+		persistStateLocked()
 
 		resp := map[string]GValue{"trade_id": tradeID}
 		encoded, _ := EncodeMessage(resp)
@@ -1626,6 +1630,7 @@ func collateralHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	collaterals[username] = coll
+	persistStateLocked()
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -1672,7 +1677,53 @@ func loggingMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+func myOrdersHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	username, authOk := getUserFromToken(r)
+	if !authOk {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	mu.RLock()
+	var myOrders []*Order
+	for _, o := range orders {
+		if o.Owner == username && (o.Status == "ACTIVE" || o.Status == "OPEN") {
+			myOrders = append(myOrders, o)
+		}
+	}
+	mu.RUnlock()
+
+	sort.Slice(myOrders, func(i, j int) bool {
+		return myOrders[i].Timestamp > myOrders[j].Timestamp
+	})
+
+	list := make([]map[string]GValue, 0, len(myOrders))
+	for _, o := range myOrders {
+		list = append(list, map[string]GValue{
+			"order_id":       o.ID,
+			"side":           o.Side,
+			"price":          o.Price,
+			"quantity":       o.Quantity,
+			"delivery_start": o.DeliveryStart,
+			"delivery_end":   o.DeliveryEnd,
+			"timestamp":      o.Timestamp,
+		})
+	}
+
+	resp := map[string]GValue{"orders": list}
+	encoded, _ := EncodeMessage(resp)
+	w.Header().Set("Content-Type", "application/x-galacticbuf")
+	w.Write(encoded)
+}
+
 func main() {
+	setupPersistenceFromEnv()
+
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/health", healthHandler)

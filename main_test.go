@@ -14,14 +14,16 @@ import (
 func resetState() {
 	mu.Lock()
 	defer mu.Unlock()
-	users = make(map[string]User)
 	tokens = make(map[string]string)
+	users = make(map[string]User)
 	dnaSamples = make(map[string][]string)
 	orders = make(map[string]*Order)
 	trades = make([]*Trade, 0)
 	orderCounter = 0
 	balances = make(map[string]int64)
 	collaterals = make(map[string]int64)
+	persistencePath = ""
+	nowFunc = func() time.Time { return time.Now().UTC() }
 }
 
 func addOrder(o *Order) {
@@ -33,7 +35,9 @@ func addOrder(o *Order) {
 func TestOrdersV2Get_OrderBookSortingAndFilters(t *testing.T) {
 	resetState()
 
-	const start = int64(3600000 * 100) // aligned hour boundary
+	nowFunc = func() time.Time { return time.UnixMilli(3600000 * 100).UTC().Add(-time.Minute) }
+
+	const start = int64(3600000 * 100)
 	const end = start + 3600000
 
 	// Valid V2 orders for the contract
