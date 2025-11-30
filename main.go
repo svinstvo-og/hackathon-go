@@ -34,6 +34,7 @@ type Order struct {
 	Side          string // "buy" or "sell"
 	Version       int    // 1 or 2
 	Timestamp     int64  // Time of submission (Created At)
+	ExecutionType string // Execution behaviour (GTC/IOC/FOK)
 }
 
 type Trade struct {
@@ -83,6 +84,36 @@ const (
 
 // default "unlimited" collateral (very large number)
 const UnlimitedCollateral int64 = 1<<62 - 1
+
+const (
+	ExecutionTypeGTC = "GTC"
+	ExecutionTypeIOC = "IOC"
+	ExecutionTypeFOK = "FOK"
+)
+
+func normalizeExecutionType(execType string) string {
+	switch strings.ToUpper(execType) {
+	case ExecutionTypeIOC:
+		return ExecutionTypeIOC
+	case ExecutionTypeFOK:
+		return ExecutionTypeFOK
+	default:
+		return ExecutionTypeGTC
+	}
+}
+
+func parseExecutionTypeInput(raw string) (string, error) {
+	if raw == "" {
+		return ExecutionTypeGTC, nil
+	}
+	raw = strings.ToUpper(raw)
+	switch raw {
+	case ExecutionTypeGTC, ExecutionTypeIOC, ExecutionTypeFOK:
+		return raw, nil
+	default:
+		return "", fmt.Errorf("invalid execution_type")
+	}
+}
 
 type GValue interface{}
 
@@ -872,6 +903,7 @@ func ordersV1Handler(w http.ResponseWriter, r *http.Request) {
 			Side:          "sell",
 			Version:       1,
 			Timestamp:     nowMillis(),
+			ExecutionType: ExecutionTypeGTC,
 		}
 		orders[orderID] = newOrder
 		mu.Unlock()
@@ -887,6 +919,7 @@ func ordersV1Handler(w http.ResponseWriter, r *http.Request) {
 // matchOrder executes the core matching logic.
 // It assumes mu is already locked.
 func matchOrder(order *Order) int64 {
+	execType := normalizeExecutionType(order.ExecutionType)
 	var filledQty int64 = 0
 	var matchingOrders []*Order
 
@@ -922,6 +955,24 @@ func matchOrder(order *Order) int64 {
 			}
 			return matchingOrders[i].Timestamp < matchingOrders[j].Timestamp // Oldest First (FIFO)
 		})
+	}
+
+	if execType == ExecutionTypeFOK {
+		required := order.Quantity
+		var available int64
+		for _, resting := range matchingOrders {
+			if order.ID == resting.ID || resting.Quantity <= 0 {
+				continue
+			}
+			available += resting.Quantity
+			if available >= required {
+				break
+			}
+		}
+		if available < required {
+			order.Status = "CANCELLED"
+			return 0
+		}
 	}
 
 	now := time.Now().UnixMilli()
@@ -982,8 +1033,13 @@ func matchOrder(order *Order) int64 {
 		}
 	}
 
-	if order.Quantity <= 0 {
+	switch {
+	case order.Quantity <= 0:
 		order.Status = "FILLED"
+	case execType == ExecutionTypeGTC:
+		order.Status = "ACTIVE"
+	default:
+		order.Status = "CANCELLED"
 	}
 
 	return filledQty
@@ -1108,9 +1164,15 @@ func ordersV2Handler(w http.ResponseWriter, r *http.Request) {
 		quantity, ok2 := data["quantity"].(int64)
 		start, ok3 := data["delivery_start"].(int64)
 		end, ok4 := data["delivery_end"].(int64)
+		execTypeRaw, _ := data["execution_type"].(string)
 
 		if !ok0 || !ok1 || !ok2 || !ok3 || !ok4 {
 			http.Error(w, "Missing fields", http.StatusBadRequest)
+			return
+		}
+		execType, err := parseExecutionTypeInput(execTypeRaw)
+		if err != nil {
+			http.Error(w, "Invalid execution_type", http.StatusBadRequest)
 			return
 		}
 
@@ -1156,6 +1218,7 @@ func ordersV2Handler(w http.ResponseWriter, r *http.Request) {
 			Side:          side,
 			Version:       2,
 			Timestamp:     now,
+			ExecutionType: execType,
 		}
 
 		// Collateral check (only if this order can reduce balance)
@@ -1174,8 +1237,7 @@ func ordersV2Handler(w http.ResponseWriter, r *http.Request) {
 		// Trigger Matching
 		filledQty := matchOrder(newOrder)
 
-		// Only insert remaining part into order book
-		if newOrder.Status != "FILLED" {
+		if execType == ExecutionTypeGTC && newOrder.Status == "ACTIVE" {
 			orders[orderID] = newOrder
 		}
 		persistStateLocked()

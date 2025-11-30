@@ -375,3 +375,191 @@ func newRequestWithContract(t *testing.T, method, path string, start, end int64,
 	t.Helper()
 	return httptest.NewRequest(method, fmt.Sprintf("%s?delivery_start=%d&delivery_end=%d", path, start, end), nil)
 }
+
+func setupUserWithToken(username, token string) {
+	mu.Lock()
+	defer mu.Unlock()
+	users[username] = User{Username: username, Password: "pw"}
+	tokens[token] = username
+}
+
+func TestOrdersV2Post_IOCPartialCancel(t *testing.T) {
+	resetState()
+	const start = int64(3600000 * 200)
+	const end = start + 3600000
+	nowFunc = func() time.Time { return time.UnixMilli(start).Add(-time.Minute) }
+
+	setupUserWithToken("maker", "makerTok")
+	setupUserWithToken("taker", "takerTok")
+
+	mu.Lock()
+	orders["rest-sell"] = &Order{
+		ID: "rest-sell", Version: 2, Status: "ACTIVE", Side: "sell", Price: 100, Quantity: 5,
+		DeliveryStart: start, DeliveryEnd: end, Owner: "maker", Timestamp: nowMillis(), ExecutionType: ExecutionTypeGTC,
+	}
+	mu.Unlock()
+
+	reqBody := map[string]GValue{
+		"side":           "buy",
+		"price":          int64(110),
+		"quantity":       int64(10),
+		"delivery_start": start,
+		"delivery_end":   end,
+		"execution_type": "IOC",
+	}
+	req := newRequest(t, http.MethodPost, "/v2/orders", reqBody)
+	req.Header.Set("Authorization", "Bearer takerTok")
+	rr := httptest.NewRecorder()
+	ordersV2Handler(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", rr.Code)
+	}
+
+	resp := decodeBody(t, rr.Body)
+	if resp["status"] != "CANCELLED" {
+		t.Fatalf("expected IOC order to cancel, got %v", resp["status"])
+	}
+	filled, ok := resp["filled_quantity"].(int64)
+	if !ok || filled != 5 {
+		t.Fatalf("expected filled_quantity=5, got %v", resp["filled_quantity"])
+	}
+	orderID, _ := resp["order_id"].(string)
+
+	mu.RLock()
+	defer mu.RUnlock()
+	if _, exists := orders[orderID]; exists {
+		t.Fatalf("IOC order should not rest on the book")
+	}
+}
+
+func TestOrdersV2Post_FOKAllOrNothing(t *testing.T) {
+	resetState()
+	const start = int64(3600000 * 300)
+	const end = start + 3600000
+	nowFunc = func() time.Time { return time.UnixMilli(start).Add(-time.Minute) }
+
+	setupUserWithToken("maker", "makerTok")
+	setupUserWithToken("taker", "takerTok")
+
+	mu.Lock()
+	orders["rest-buy"] = &Order{
+		ID: "rest-buy", Version: 2, Status: "ACTIVE", Side: "buy", Price: 100, Quantity: 5,
+		DeliveryStart: start, DeliveryEnd: end, Owner: "maker", Timestamp: nowMillis(), ExecutionType: ExecutionTypeGTC,
+	}
+	mu.Unlock()
+
+	reqBody := map[string]GValue{
+		"side":           "sell",
+		"price":          int64(100),
+		"quantity":       int64(10),
+		"delivery_start": start,
+		"delivery_end":   end,
+		"execution_type": "FOK",
+	}
+	req := newRequest(t, http.MethodPost, "/v2/orders", reqBody)
+	req.Header.Set("Authorization", "Bearer takerTok")
+	rr := httptest.NewRecorder()
+	ordersV2Handler(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", rr.Code)
+	}
+
+	resp := decodeBody(t, rr.Body)
+	if resp["status"] != "CANCELLED" {
+		t.Fatalf("expected FOK order to cancel, got %v", resp["status"])
+	}
+	if fq, _ := resp["filled_quantity"].(int64); fq != 0 {
+		t.Fatalf("expected zero fill for unfilled FOK, got %d", fq)
+	}
+	orderID, _ := resp["order_id"].(string)
+
+	mu.RLock()
+	if _, exists := orders[orderID]; exists {
+		mu.RUnlock()
+		t.Fatalf("FOK order should not rest on the book")
+	}
+	mu.RUnlock()
+}
+
+func TestOrdersV2Post_FOKFullFill(t *testing.T) {
+	resetState()
+	const start = int64(3600000 * 400)
+	const end = start + 3600000
+	nowFunc = func() time.Time { return time.UnixMilli(start).Add(-time.Minute) }
+
+	setupUserWithToken("maker1", "makerTok1")
+	setupUserWithToken("maker2", "makerTok2")
+	setupUserWithToken("taker", "takerTok")
+
+	mu.Lock()
+	orders["rest-buy-1"] = &Order{
+		ID: "rest-buy-1", Version: 2, Status: "ACTIVE", Side: "buy", Price: 100, Quantity: 4,
+		DeliveryStart: start, DeliveryEnd: end, Owner: "maker1", Timestamp: nowMillis(), ExecutionType: ExecutionTypeGTC,
+	}
+	orders["rest-buy-2"] = &Order{
+		ID: "rest-buy-2", Version: 2, Status: "ACTIVE", Side: "buy", Price: 99, Quantity: 6,
+		DeliveryStart: start, DeliveryEnd: end, Owner: "maker2", Timestamp: nowMillis() + 1, ExecutionType: ExecutionTypeGTC,
+	}
+	mu.Unlock()
+
+	reqBody := map[string]GValue{
+		"side":           "sell",
+		"price":          int64(99),
+		"quantity":       int64(10),
+		"delivery_start": start,
+		"delivery_end":   end,
+		"execution_type": "FOK",
+	}
+	req := newRequest(t, http.MethodPost, "/v2/orders", reqBody)
+	req.Header.Set("Authorization", "Bearer takerTok")
+	rr := httptest.NewRecorder()
+	ordersV2Handler(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", rr.Code)
+	}
+
+	resp := decodeBody(t, rr.Body)
+	if resp["status"] != "FILLED" {
+		t.Fatalf("expected FOK to fill completely, got %v", resp["status"])
+	}
+	if fq, _ := resp["filled_quantity"].(int64); fq != 10 {
+		t.Fatalf("expected filled_quantity=10, got %d", fq)
+	}
+	orderID, _ := resp["order_id"].(string)
+
+	mu.RLock()
+	if _, exists := orders[orderID]; exists {
+		mu.RUnlock()
+		t.Fatalf("filled FOK order should not rest on the book")
+	}
+	mu.RUnlock()
+}
+
+func TestOrdersV2Post_InvalidExecutionType(t *testing.T) {
+	resetState()
+	const start = int64(3600000 * 500)
+	const end = start + 3600000
+	nowFunc = func() time.Time { return time.UnixMilli(start).Add(-time.Minute) }
+
+	setupUserWithToken("trader", "tok")
+
+	reqBody := map[string]GValue{
+		"side":           "buy",
+		"price":          int64(100),
+		"quantity":       int64(1),
+		"delivery_start": start,
+		"delivery_end":   end,
+		"execution_type": "DAY",
+	}
+	req := newRequest(t, http.MethodPost, "/v2/orders", reqBody)
+	req.Header.Set("Authorization", "Bearer tok")
+	rr := httptest.NewRecorder()
+	ordersV2Handler(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for invalid execution_type, got %d", rr.Code)
+	}
+}
